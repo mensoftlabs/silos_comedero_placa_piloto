@@ -95,6 +95,28 @@ static uint8_t dec2bcd(uint8_t val);
 esp_err_t ds3231_set_time(struct tm *dt);
 esp_err_t ds3231_get_time(struct tm *dt);
 static void i2c_master_init(void);
+//dht22
+#ifndef DHT_GPIO
+#define DHT_GPIO       GPIO_NUM_26     // DATA del DHT22
+#endif
+
+#define DHT_RETRIES        85          // Max lazos de espera por transición
+#define DHT_START_LOW_US  1100         // Pulso de inicio (µs), 1.1 ms
+#define DHT_RESP_LOW_US     80         // Espera típica de respuesta
+#define DHT_RESP_HIGH_US     80
+#define DHT_BIT_LOW_US       50
+#define DHT_ZERO_HIGH_US     28
+#define DHT_ONE_HIGH_US      70
+#define DHT_THRESHOLD_US     45        // >45us = '1', si no '0'
+#define DHT_MIN_INTERVAL_MS 2000       // Min 2s entre lecturas DHT22
+
+// Prototipos DHT
+static inline void dht_set_input(void);
+static inline void dht_set_output(void);
+static int  dht_wait_level(int level, uint32_t timeout_us);
+static esp_err_t dht22_read_raw(uint8_t data[5]);
+esp_err_t dht22_read(float *temperature_c, float *humidity_rh);
+
 
 void app_main(void)
 {
@@ -185,6 +207,27 @@ void app_main(void)
         {
             ESP_LOGW(TAG, "El buffer esta lleno");
         }
+
+
+        static uint64_t last_dht = 0;
+        //const uint64_t HORA_US = 3600ULL * 1000000ULL; // 1 hora en microsegundos
+        const uint64_t HORA_US = 30ULL * 1000000ULL; // 30 segundos en microsegundos
+
+        if ((esp_timer_get_time() - last_dht) >= HORA_US) {
+            float t, h;
+            esp_err_t e = dht22_read(&t, &h);
+            if (e == ESP_OK) {
+                ESP_LOGI(TAG, "DHT22 -> Temp: %.1f °C  Hum: %.1f %%", t, h);
+            } else if (e == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Intento demasiado pronto (DHT22)");
+            } else if (e == ESP_ERR_INVALID_CRC) {
+                ESP_LOGW(TAG, "DHT22 CRC inválido");
+            } else {
+                ESP_LOGW(TAG, "DHT22 timeout/err: %s", esp_err_to_name(e));
+            }
+            last_dht = esp_timer_get_time();
+        }
+
         
         
         
@@ -379,6 +422,17 @@ esp_err_t config_pin(void)
     gpio_set_direction(SENSE_2, GPIO_MODE_INPUT);
     //gpio_set_direction(SENSE_3, GPIO_MODE_INPUT);
 
+    // --- DHT22 GPIO26 ---
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << DHT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,   // tenemos pull-up externa, pero habilitar interna no molesta
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+
     return ESP_OK;
 }
 
@@ -446,7 +500,7 @@ uint8_t manejar_eventos()
         struct tm now = {0};
 
         if (ds3231_get_time(&now) == ESP_OK) {
-            // Llenás tu estructura "registro" con lo mismo que hacías antes
+            // Llenas tu estructura "registro" con lo mismo que hacías antes
             registro.tm_year = (now.tm_year + 1900) % 100;  // Año 2 dígitos
             registro.tm_mon  = now.tm_mon + 1;              // Mes
             registro.tm_mday = now.tm_mday;                 // Día
@@ -1010,4 +1064,94 @@ esp_err_t ds3231_get_time(struct tm *dt) {
         dt->tm_isdst = -1;                          // sin horario de verano
     }
     return ret;
+}
+
+//dht22
+#include "esp_rom_sys.h"  // para esp_rom_delay_us
+
+static inline void dht_set_input(void) {
+    gpio_set_direction(DHT_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(DHT_GPIO, GPIO_PULLUP_ONLY); // usa tu pull-up externa de 3.3k
+}
+
+static inline void dht_set_output(void) {
+    gpio_set_direction(DHT_GPIO, GPIO_MODE_OUTPUT);
+}
+
+static int dht_wait_level(int level, uint32_t timeout_us) {
+    // Espera a que la línea esté en 'level' o agote timeout; devuelve los µs transcurridos o -1 si timeout
+    uint32_t t = 0;
+    while (gpio_get_level(DHT_GPIO) != level) {
+        if (t++ >= timeout_us) return -1;
+        esp_rom_delay_us(1);
+    }
+    return (int)t;
+}
+
+static esp_err_t dht22_read_raw(uint8_t data[5]) {
+    // Secuencia de inicio
+    dht_set_output();
+    gpio_set_level(DHT_GPIO, 0);
+    esp_rom_delay_us(DHT_START_LOW_US);
+    gpio_set_level(DHT_GPIO, 1);
+    esp_rom_delay_us(30);            // release
+    dht_set_input();
+
+    // Respuesta del sensor: ~80us LOW + ~80us HIGH
+    if (dht_wait_level(0, 200) < 0) return ESP_ERR_TIMEOUT;
+    if (dht_wait_level(1, 200) < 0) return ESP_ERR_TIMEOUT;
+
+    // Lectura de 40 bits
+    uint8_t bits[40] = {0};
+    for (int i = 0; i < 40; i++) {
+        // Cada bit: ~50us LOW
+        if (dht_wait_level(0, 100) < 0) return ESP_ERR_TIMEOUT;
+        // tiempo en nivel ALTO define 0/1
+        int t_high = dht_wait_level(1, 120); // medimos cuánto tarda en volver a caer
+        if (t_high < 0) return ESP_ERR_TIMEOUT;
+        bits[i] = (t_high > DHT_THRESHOLD_US) ? 1 : 0;
+    }
+
+    // Empaquetar en 5 bytes
+    for (int i = 0; i < 5; i++) {
+        uint8_t v = 0;
+        for (int b = 0; b < 8; b++) {
+            v <<= 1;
+            v |= bits[i * 8 + b] & 0x01;
+        }
+        data[i] = v;
+    }
+
+    // Checksum
+    uint8_t sum = (uint8_t)(data[0] + data[1] + data[2] + data[3]);
+    if (sum != data[4]) return ESP_ERR_INVALID_CRC;
+
+    return ESP_OK;
+}
+
+esp_err_t dht22_read(float *temperature_c, float *humidity_rh) {
+    static int64_t last_read = 0;
+    int64_t now = esp_timer_get_time(); // µs
+
+    // Respetar 2s entre lecturas
+    if (last_read != 0 && (now - last_read) < (DHT_MIN_INTERVAL_MS * 1000)) {
+        return ESP_ERR_INVALID_STATE; // Demasiado pronto
+    }
+
+    uint8_t raw[5] = {0};
+    esp_err_t err = dht22_read_raw(raw);
+    if (err != ESP_OK) return err;
+
+    // Humedad
+    uint16_t rh = ((uint16_t)raw[0] << 8) | raw[1];
+    // Temperatura (signo en bit15)
+    uint16_t t  = ((uint16_t)raw[2] << 8) | raw[3];
+    bool neg = t & 0x8000;
+    t &= 0x7FFF;
+
+    if (humidity_rh)   *humidity_rh   = rh / 10.0f;
+    if (temperature_c) *temperature_c = (neg ? -(int)t : (int)t) / 10.0f;
+
+    last_read = now;
+    return ESP_OK;
 }
